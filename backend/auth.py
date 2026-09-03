@@ -1,7 +1,10 @@
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
+
+logger = logging.getLogger(__name__)
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -186,15 +189,18 @@ def authenticate_user(db: Session, email: str, password: str) -> User:
 
     user = db.query(User).filter(User.email == email).first()
     if not user:
+        logger.warning("AUTH_DIAGNOSTIC: user_not_found")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email ou senha incorretos",
         )
 
     if not verify_password(password, user.password_hash):
+        logger.warning("AUTH_DIAGNOSTIC: password_mismatch")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email ou senha incorretos",
         )
 
+    logger.info("AUTH_DIAGNOSTIC: login_success")
     return user
