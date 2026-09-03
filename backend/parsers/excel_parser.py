@@ -1,3 +1,9 @@
+"""CSV and XLSX parser with robust column detection and transaction extraction.
+
+Supports Brazilian and international financial statement formats including
+dual credit/debit columns, multiple encodings, and various delimiters.
+"""
+import logging
 import re
 from datetime import datetime
 from io import BytesIO, StringIO
@@ -5,146 +11,125 @@ from io import BytesIO, StringIO
 import openpyxl
 import pandas as pd
 
-DATE_PATTERNS = [
-    r"\d{2}/\d{2}/\d{4}",
-    r"\d{2}-\d{2}-\d{4}",
-    r"\d{4}-\d{2}-\d{2}",
-    r"\d{2}/\d{2}/\d{2}",
-]
+from .utils import (
+    CREDIT_KEYWORDS,
+    DEBIT_KEYWORDS,
+    NON_AMOUNT_KEYWORDS,
+    is_amount_column,
+    is_credit_column,
+    is_date_column,
+    is_desc_column,
+    is_debit_column,
+    normalize_text,
+    parse_date,
+    parse_money,
+)
 
-AMOUNT_PATTERNS = [
-    r"[+-]?\d+[\.,]\d{2}",
-]
+logger = logging.getLogger(__name__)
 
-DATE_KEYWORDS = {"data", "date", "dt", "dt.", "dat", "datap", "lancamento", "lançamento", "movement", "post_date"}
-DESC_KEYWORDS = {
-    "descricao", "descrição", "description", "historico", "histórico", "memo", "detail",
-    "detalhe", "descricao_da_transacao", "estabelecimento", "merchant", "payee",
-    "beneficiario", "beneficiário", "favorecido", "nota", "complemento",
-}
-AMOUNT_KEYWORDS = {
-    "valor", "amount", "value", "total", "quantia", "montante", "vlr", "vlr.",
-    "credit", "debit", "credito", "debito", "saque", "deposito", "depósito",
-}
-NON_AMOUNT_KEYWORDS = {
-    "codigo", "código", "code", "id", "numero", "número", "conta", "account",
-    "agency", "agencia", "Sequence", "sequencia",
-}
+# Keep legacy names for backward compatibility with tests
+_parse_amount = parse_money
+_parse_date = parse_date
 
 
-def _is_date_column(col_name: str, sample_values: list) -> bool:
-    col_lower = col_name.lower().strip()
-    if any(kw in col_lower for kw in DATE_KEYWORDS):
-        return True
-    if not sample_values:
-        return False
-    match_count = 0
-    for v in sample_values[:10]:
-        s = str(v).strip()
-        for pat in DATE_PATTERNS:
-            if re.search(pat, s):
-                match_count += 1
-                break
-    return match_count >= len(sample_values) * 0.5
+# ---------------------------------------------------------------------------
+# CSV-specific helpers
+# ---------------------------------------------------------------------------
+
+def _detect_csv_delimiter(text: str) -> str:
+    """Detect CSV delimiter by counting occurrences in the first 10 lines."""
+    first_lines = text.split("\n")[:10]
+    comma_count = sum(line.count(",") for line in first_lines)
+    semicolon_count = sum(line.count(";") for line in first_lines)
+    tab_count = sum(line.count("\t") for line in first_lines)
+
+    # Tab often means tab-separated
+    if tab_count > 0 and tab_count >= comma_count and tab_count >= semicolon_count:
+        return "\t"
+    if semicolon_count > comma_count:
+        return ";"
+    return ","
 
 
-def _is_amount_column(col_name: str, sample_values: list) -> bool:
-    col_lower = col_name.lower().strip()
-    if any(kw in col_lower for kw in NON_AMOUNT_KEYWORDS):
-        return False
-    if any(kw in col_lower for kw in AMOUNT_KEYWORDS):
-        return True
-    if not sample_values:
-        return False
-    numeric_count = 0
-    has_decimal = 0
-    for v in sample_values[:10]:
-        if v is None:
-            continue
-        s = str(v).strip()
-        s_clean = s.replace(".", "").replace(",", ".")
+def _decode_with_fallback(file_content: bytes) -> tuple[str, str]:
+    """Decode bytes to string trying multiple encodings.
+
+    Returns (decoded_text, encoding_name).
+    """
+    if not file_content:
+        return "", "utf-8"
+
+    # Check for BOM markers first
+    if file_content[:3] == b"\xef\xbb\xbf":
+        return file_content[3:].decode("utf-8"), "utf-8-sig"
+    if file_content[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        # UTF-16 BOM — not common for CSV but handle gracefully
+        for enc in ("utf-16", "utf-16-le", "utf-16-be"):
+            try:
+                return file_content.decode(enc), enc
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+    for encoding in ("utf-8", "latin-1", "cp1252", "iso-8859-1"):
         try:
-            float(s_clean)
-            numeric_count += 1
-            if "," in s or ("." in s and s.count(".") == 1 and len(s.split(".")[-1]) == 2):
-                has_decimal += 1
-        except ValueError:
-            pass
-    if numeric_count < len(sample_values) * 0.5:
-        return False
-    if has_decimal >= numeric_count * 0.5:
-        return True
-    return False
-
-
-def _is_desc_column(col_name: str, sample_values: list) -> bool:
-    col_lower = col_name.lower().strip()
-    if any(kw in col_lower for kw in DESC_KEYWORDS):
-        return True
-    if not sample_values:
-        return False
-    text_count = sum(1 for v in sample_values[:10] if v and isinstance(v, str) and len(v) > 3)
-    return text_count >= len(sample_values) * 0.5
-
-
-def _parse_date(val) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, datetime):
-        return val.strftime("%Y-%m-%d")
-    s = str(val).strip()
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except ValueError:
+            return file_content.decode(encoding), encoding
+        except (UnicodeDecodeError, LookupError):
             continue
-    return s
+
+    return file_content.decode("utf-8", errors="replace"), "utf-8-fallback"
 
 
-def _parse_amount(val) -> float:
-    if val is None:
-        return 0.0
-    if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val).strip()
-    s = s.replace("R$", "").replace("$", "").strip()
-    negative = False
-    if s.startswith("-") or s.startswith("("):
-        negative = True
-    s = s.lstrip("-").lstrip("(").rstrip(")")
-    if "," in s:
-        # Formato brasileiro: ponto é milhar, vírgula é decimal (1.234,56 ou 1234,56)
-        s = s.replace(".", "").replace(",", ".")
-    elif "." in s and (s.count(".") != 1 or len(s.rsplit(".", 1)[-1]) > 2):
-        # Sem vírgula: um único ponto com ≤2 casas decimais é formato internacional (1234.56);
-        # múltiplos pontos ou 3+ casas são milhares brasileiros sem vírgula (1.234 / 1.234.567).
-        s = s.replace(".", "")
-    try:
-        amount = float(s)
-        return -amount if negative else amount
-    except ValueError:
-        return 0.0
+# ---------------------------------------------------------------------------
+# Row-level transaction extraction (shared by CSV and XLSX)
+# ---------------------------------------------------------------------------
 
+def _extract_transactions_from_rows(rows: list[dict]) -> tuple[list[dict], dict]:
+    """Extract transactions from a list of row dicts.
 
-def _extract_transactions_from_rows(rows: list[dict]) -> list[dict]:
+    Returns (transactions, diagnostics) where diagnostics contains
+    columns_detected, rows_processed, rejection_counts, etc.
+    """
     if not rows:
-        return []
+        return [], {"rows_processed": 0, "transactions_found": 0, "rejection_counts": {}}
 
     all_cols = list(rows[0].keys())
     date_col = None
     desc_col = None
     amount_col = None
+    credit_col = None
+    debit_col = None
 
+    diagnostics = {
+        "rows_processed": len(rows),
+        "columns_detected": {},
+        "rejection_counts": {
+            "missing_date": 0,
+            "missing_amount": 0,
+            "zero_amount": 0,
+        },
+    }
+
+    # --- Detect columns ---
     for col in all_cols:
         sample = [r.get(col) for r in rows[:20] if r.get(col) is not None]
-        if date_col is None and _is_date_column(col, sample):
+        col_lower = col.lower().strip()
+
+        if date_col is None and is_date_column(col, sample):
             date_col = col
-        elif amount_col is None and _is_amount_column(col, sample):
+        elif is_credit_column(col):
+            credit_col = col
+        elif is_debit_column(col):
+            debit_col = col
+        elif amount_col is None and is_amount_column(col, sample):
             amount_col = col
-        elif desc_col is None and _is_desc_column(col, sample):
+        elif desc_col is None and is_desc_column(col, sample):
             desc_col = col
 
-    if amount_col is None:
+    # If we have credit/debit but no single amount column, use credit+debit
+    use_dual = credit_col is not None and debit_col is not None and amount_col is None
+
+    # Fallback: scan for numeric columns if amount not found
+    if amount_col is None and not use_dual:
         numeric_cols = []
         for col in all_cols:
             col_lower = col.lower().strip()
@@ -156,42 +141,111 @@ def _extract_transactions_from_rows(rows: list[dict]) -> list[dict]:
             for v in sample:
                 if v is None:
                     continue
-                s = str(v).strip()
-                s_clean = s.replace(".", "").replace(",", ".")
-                try:
-                    float(s_clean)
+                parsed = parse_money(str(v).strip())
+                if parsed is not None:
                     numeric_count += 1
+                    s = str(v).strip()
                     if "," in s or ("." in s and s.count(".") == 1 and len(s.split(".")[-1]) == 2):
                         has_decimal += 1
-                except ValueError:
-                    pass
-            if numeric_count >= len(sample) * 0.5:
+            if numeric_count >= max(1, len(sample) * 0.4):
                 numeric_cols.append((col, has_decimal))
         if numeric_cols:
             numeric_cols.sort(key=lambda x: x[1], reverse=True)
             amount_col = numeric_cols[0][0]
 
+    # Fallback: pick first non-date/non-amount column as description
     if desc_col is None:
         for col in all_cols:
-            if col != date_col and col != amount_col:
+            if col != date_col and col != amount_col and col != credit_col and col != debit_col:
                 desc_col = col
                 break
 
+    diagnostics["columns_detected"] = {
+        "date": date_col,
+        "description": desc_col,
+        "amount": amount_col,
+        "credit": credit_col,
+        "debit": debit_col,
+    }
+
+    logger.info(
+        "Column detection: date=%s, desc=%s, amount=%s, credit=%s, debit=%s",
+        date_col, desc_col, amount_col, credit_col, debit_col,
+    )
+
+    if not use_dual and amount_col is None:
+        logger.warning("No amount column detected — returning empty transaction list")
+        diagnostics["rejection_counts"]["missing_amount"] = len(rows)
+        return [], diagnostics
+
+    # --- Extract transactions ---
     transactions = []
     for row in rows:
-        amount = _parse_amount(row.get(amount_col)) if amount_col else 0.0
-        if amount == 0:
+        # Parse date
+        raw_date = row.get(date_col) if date_col else None
+        parsed_date = parse_date(str(raw_date)) if raw_date is not None else ""
+        if not parsed_date:
+            diagnostics["rejection_counts"]["missing_date"] += 1
             continue
+
+        # Parse description
+        raw_desc = row.get(desc_col) if desc_col else ""
+        description = normalize_text(str(raw_desc)) if raw_desc is not None else ""
+
+        if use_dual:
+            # Dual credit/debit columns
+            raw_credit = row.get(credit_col) if credit_col else None
+            raw_debit = row.get(debit_col) if debit_col else None
+            credit_val = parse_money(str(raw_credit)) if raw_credit is not None else None
+            debit_val = parse_money(str(raw_debit)) if raw_debit is not None else None
+
+            if credit_val is None and debit_val is None:
+                diagnostics["rejection_counts"]["missing_amount"] += 1
+                continue
+            if credit_val is None:
+                credit_val = 0.0
+            if debit_val is None:
+                debit_val = 0.0
+
+            # Credit is positive, debit is negative
+            amount = credit_val - debit_val
+            if amount == 0:
+                diagnostics["rejection_counts"]["zero_amount"] += 1
+                continue
+        else:
+            # Single amount column
+            raw_amount = row.get(amount_col) if amount_col else None
+            if raw_amount is None:
+                diagnostics["rejection_counts"]["missing_amount"] += 1
+                continue
+            amount = parse_money(str(raw_amount))
+            if amount is None:
+                diagnostics["rejection_counts"]["missing_amount"] += 1
+                continue
+
         transactions.append({
-            "date": _parse_date(row.get(date_col)) if date_col else "",
-            "description": str(row.get(desc_col, "")) if desc_col else "",
+            "date": parsed_date,
+            "description": description,
             "amount": round(amount, 2),
         })
 
-    return transactions
+    diagnostics["transactions_found"] = len(transactions)
 
+    logger.info(
+        "Extracted %d transactions from %d rows (rejected: %s)",
+        len(transactions), len(rows), diagnostics["rejection_counts"],
+    )
+
+    return transactions, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# XLSX parser
+# ---------------------------------------------------------------------------
 
 def parse_excel(file_content: bytes, filename: str = "") -> dict:
+    """Parse an Excel XLSX/XLS file and extract transactions."""
+    logger.info("Starting XLSX parse for filename=%s, size=%d bytes", filename, len(file_content))
     try:
         wb = openpyxl.load_workbook(BytesIO(file_content), read_only=True, data_only=True)
         sheets_data = {}
@@ -221,7 +275,7 @@ def parse_excel(file_content: bytes, filename: str = "") -> dict:
                 row["_sheet"] = sheet_name
                 all_rows.append(row)
 
-        transactions = _extract_transactions_from_rows(all_rows)
+        transactions, tx_diag = _extract_transactions_from_rows(all_rows)
 
         total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
         total_expenses = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
@@ -238,6 +292,18 @@ def parse_excel(file_content: bytes, filename: str = "") -> dict:
                     "max": round(float(df[col].max()), 2),
                 }
 
+        diagnostics = {
+            "rows_processed": tx_diag.get("rows_processed", 0),
+            "transactions_found": tx_diag.get("transactions_found", 0),
+            "columns_detected": tx_diag.get("columns_detected", {}),
+            "rejection_counts": tx_diag.get("rejection_counts", {}),
+        }
+
+        logger.info(
+            "XLSX parse complete: %d sheets, %d rows, %d transactions",
+            len(sheets_data), total_rows, len(transactions),
+        )
+
         return {
             "type": "XLSX",
             "sheets": sheet_names,
@@ -249,12 +315,16 @@ def parse_excel(file_content: bytes, filename: str = "") -> dict:
             "total_transactions": len(transactions),
             "total_income": round(total_income, 2),
             "total_expenses": round(total_expenses, 2),
-            "summary": f"Planilha Excel com {len(sheets_data)} aba(s) e {total_rows} linhas. "
-                       f"Transações: {len(transactions)}. "
-                       f"Receitas: R$ {total_income:,.2f}. Despesas: R$ {total_expenses:,.2f}.",
+            "summary": (
+                f"Planilha Excel com {len(sheets_data)} aba(s) e {total_rows} linhas. "
+                f"Transações: {len(transactions)}. "
+                f"Receitas: R$ {total_income:,.2f}. Despesas: R$ {total_expenses:,.2f}."
+            ),
+            "_diagnostics": diagnostics,
         }
 
     except Exception as e:
+        logger.exception("XLSX parse failed")
         return {
             "type": "XLSX",
             "error": str(e),
@@ -264,25 +334,19 @@ def parse_excel(file_content: bytes, filename: str = "") -> dict:
         }
 
 
-def _detect_csv_delimiter(text: str) -> str:
-    first_lines = text.split("\n")[:5]
-    comma_count = sum(line.count(",") for line in first_lines)
-    semicolon_count = sum(line.count(";") for line in first_lines)
-    if semicolon_count > comma_count:
-        return ";"
-    return ","
-
-
-def _decode_with_fallback(file_content: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252", "iso-8859-1"):
-        try:
-            return file_content.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return file_content.decode("utf-8", errors="replace")
-
+# ---------------------------------------------------------------------------
+# CSV parser
+# ---------------------------------------------------------------------------
 
 def parse_csv(file_content: bytes, filename: str = "") -> dict:
+    """Parse a CSV file and extract transactions.
+
+    Supports multiple encodings (UTF-8, UTF-8 BOM, CP1252, Latin-1),
+    delimiters (comma, semicolon, tab), and both single amount column
+    and dual credit/debit column formats.
+    """
+    logger.info("Starting CSV parse for filename=%s, size=%d bytes", filename, len(file_content))
+
     try:
         if not file_content or not file_content.strip():
             return {
@@ -290,11 +354,16 @@ def parse_csv(file_content: bytes, filename: str = "") -> dict:
                 "transactions": [],
                 "data": [],
                 "summary": "Arquivo CSV vazio.",
+                "_diagnostics": {"rows_processed": 0, "transactions_found": 0, "rejection_counts": {}},
             }
 
-        text = _decode_with_fallback(file_content)
+        text, encoding = _decode_with_fallback(file_content)
+        logger.info("Detected encoding: %s", encoding)
+
         delimiter = _detect_csv_delimiter(text)
-        df = pd.read_csv(StringIO(text), sep=delimiter, on_bad_lines="skip")
+        logger.info("Detected delimiter: %r", delimiter)
+
+        df = pd.read_csv(StringIO(text), sep=delimiter, on_bad_lines="skip", dtype=str)
 
         if df.empty or len(df.columns) < 2:
             return {
@@ -304,10 +373,14 @@ def parse_csv(file_content: bytes, filename: str = "") -> dict:
                 "data": [],
                 "transactions": [],
                 "summary": "Arquivo CSV sem dados tabulares válidos.",
+                "_diagnostics": {"rows_processed": 0, "transactions_found": 0, "rejection_counts": {}},
             }
 
+        # Normalize column names: strip whitespace
+        df.columns = [c.strip() for c in df.columns]
+
         rows = df.head(500).to_dict(orient="records")
-        transactions = _extract_transactions_from_rows(rows)
+        transactions, tx_diag = _extract_transactions_from_rows(rows)
 
         total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
         total_expenses = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
@@ -322,6 +395,20 @@ def parse_csv(file_content: bytes, filename: str = "") -> dict:
                 "max": round(float(df[col].max()), 2),
             }
 
+        diagnostics = {
+            "rows_processed": tx_diag.get("rows_processed", 0),
+            "transactions_found": tx_diag.get("transactions_found", 0),
+            "columns_detected": tx_diag.get("columns_detected", {}),
+            "rejection_counts": tx_diag.get("rejection_counts", {}),
+            "encoding": encoding,
+            "delimiter": delimiter,
+        }
+
+        logger.info(
+            "CSV parse complete: %d rows, %d columns, %d transactions",
+            len(df), len(df.columns), len(transactions),
+        )
+
         return {
             "type": "CSV",
             "columns": list(df.columns),
@@ -332,16 +419,21 @@ def parse_csv(file_content: bytes, filename: str = "") -> dict:
             "total_transactions": len(transactions),
             "total_income": round(total_income, 2),
             "total_expenses": round(total_expenses, 2),
-            "summary": f"Planilha CSV com {len(df)} linhas e {len(df.columns)} colunas. "
-                       f"Transações: {len(transactions)}. "
-                       f"Receitas: R$ {total_income:,.2f}. Despesas: R$ {total_expenses:,.2f}.",
+            "summary": (
+                f"Planilha CSV com {len(df)} linhas e {len(df.columns)} colunas. "
+                f"Transações: {len(transactions)}. "
+                f"Receitas: R$ {total_income:,.2f}. Despesas: R$ {total_expenses:,.2f}."
+            ),
+            "_diagnostics": diagnostics,
         }
 
     except Exception as e:
+        logger.exception("CSV parse failed")
         return {
             "type": "CSV",
             "error": str(e),
             "transactions": [],
             "data": [],
             "summary": f"Erro ao processar CSV: {e}",
+            "_diagnostics": {"rows_processed": 0, "transactions_found": 0, "rejection_counts": {}},
         }
