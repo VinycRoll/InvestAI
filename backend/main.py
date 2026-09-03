@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -26,7 +26,7 @@ from .config import (
     GEMINI_API_KEY,
     MAX_FILE_SIZE,
 )
-from .database import Analysis, ChatMessage, User, UserCategory, get_db, init_db
+from .database import Analysis, ChatMessage, User, UserCategory, engine, get_db, init_db
 from .database import File as FileModel
 from .parsers import parse_csv, parse_excel, parse_ofx, parse_pdf
 from .services.analysis import (
@@ -825,4 +825,30 @@ def health(db: Session = Depends(get_db)):
         "status": "ok" if all(v == "ok" or v == "configured" for v in checks.values()) else "degraded",
         "version": APP_VERSION,
         "checks": checks,
+    }
+
+
+@app.get("/api/_diagnostic", summary="Database diagnostic (temp)")
+def diagnostic(db: Session = Depends(get_db)):
+    users_count = db.query(User).count()
+    files_count = db.query(FileModel).count()
+    messages_count = db.query(ChatMessage).count()
+
+    columns = [c["name"] for c in sa_inspect(engine).get_columns("users")]
+    has_password_hash = "password_hash" in columns
+
+    alembic_version = None
+    try:
+        row = db.execute(text("SELECT version_num FROM alembic_version")).fetchone()
+        if row:
+            alembic_version = row[0]
+    except SQLAlchemyError:
+        pass
+
+    return {
+        "users_count": users_count,
+        "files_count": files_count,
+        "chat_messages_count": messages_count,
+        "has_password_hash_column": has_password_hash,
+        "alembic_version": alembic_version,
     }
