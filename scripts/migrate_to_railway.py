@@ -6,18 +6,16 @@ Este script é SEGURO:
   - Faz backup antes de qualquer alteração
   - Usa transação (rollback se falhar)
   - Nunca apaga registros existentes
-  - Nunca substitui dados existentes
+  - Nunca sobrescreve dados não relacionados ao usuário migrado
+  - Atualiza APENAS password_hash quando o usuário já existe no target
   - Verifica integridade referencial após migração
 
 Uso:
-  # Teste local (copia o investia.db para um arquivo temporário):
+  # Teste local (dry-run):
   python scripts/migrate_to_railway.py --dry-run
 
   # Migração real no Railway:
   python scripts/migrate_to_railway.py --source investia.db --target /data/investia.db
-
-  # Migração real local (para testar):
-  python scripts/migrate_to_railway.py --source investia.db --target /tmp/test_target.db
 
 IMPORTANTE:
   - NÃO commitar o investia.db
@@ -66,7 +64,11 @@ def read_source_data(source_conn: sqlite3.Connection) -> dict:
     data = {}
 
     # User
-    cur.execute("SELECT id, email, name, password_hash, avatar_url, provider, created_at FROM users WHERE id = ?", (SOURCE_USER_ID,))
+    cur.execute(
+        "SELECT id, email, name, password_hash, avatar_url, provider, created_at "
+        "FROM users WHERE id = ?",
+        (SOURCE_USER_ID,),
+    )
     row = cur.fetchone()
     if not row:
         log(f"ERRO: user_id={SOURCE_USER_ID} nao encontrado no banco fonte")
@@ -79,7 +81,11 @@ def read_source_data(source_conn: sqlite3.Connection) -> dict:
     log(f"User fonte: id={row[0]} name={row[2]} provider={row[5]}")
 
     # Files
-    cur.execute("SELECT id, user_id, filename, file_type, file_size, parsed_data, created_at FROM files WHERE user_id = ?", (SOURCE_USER_ID,))
+    cur.execute(
+        "SELECT id, user_id, filename, file_type, file_size, parsed_data, created_at "
+        "FROM files WHERE user_id = ?",
+        (SOURCE_USER_ID,),
+    )
     data["files"] = []
     for r in cur.fetchall():
         data["files"].append({
@@ -90,7 +96,11 @@ def read_source_data(source_conn: sqlite3.Connection) -> dict:
     log(f"Files fonte: {len(data['files'])} registro(s)")
 
     # Analyses
-    cur.execute("SELECT id, user_id, file_id, analysis_type, result, created_at FROM analyses WHERE user_id = ?", (SOURCE_USER_ID,))
+    cur.execute(
+        "SELECT id, user_id, file_id, analysis_type, result, created_at "
+        "FROM analyses WHERE user_id = ?",
+        (SOURCE_USER_ID,),
+    )
     data["analyses"] = []
     for r in cur.fetchall():
         data["analyses"].append({
@@ -100,7 +110,11 @@ def read_source_data(source_conn: sqlite3.Connection) -> dict:
     log(f"Analyses fonte: {len(data['analyses'])} registro(s)")
 
     # Chat messages
-    cur.execute("SELECT id, user_id, role, content, created_at FROM chat_messages WHERE user_id = ?", (SOURCE_USER_ID,))
+    cur.execute(
+        "SELECT id, user_id, role, content, created_at "
+        "FROM chat_messages WHERE user_id = ?",
+        (SOURCE_USER_ID,),
+    )
     data["chat_messages"] = []
     for r in cur.fetchall():
         data["chat_messages"].append({
@@ -110,7 +124,11 @@ def read_source_data(source_conn: sqlite3.Connection) -> dict:
     log(f"Chat messages fonte: {len(data['chat_messages'])} registro(s)")
 
     # User categories
-    cur.execute("SELECT id, user_id, name, keywords, created_at FROM user_categories WHERE user_id = ?", (SOURCE_USER_ID,))
+    cur.execute(
+        "SELECT id, user_id, name, keywords, created_at "
+        "FROM user_categories WHERE user_id = ?",
+        (SOURCE_USER_ID,),
+    )
     data["user_categories"] = []
     for r in cur.fetchall():
         data["user_categories"].append({
@@ -128,30 +146,47 @@ def get_max_ids(target_conn: sqlite3.Connection) -> dict:
     for table in ["users", "files", "analyses", "chat_messages", "user_categories"]:
         cur.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}")
         max_ids[table] = cur.fetchone()[0]
-    log(f"IDs maximos na producao: {max_ids}")
+    log(f"IDs maximos no target: {max_ids}")
     return max_ids
 
 
-def check_user_exists(target_conn: sqlite3.Connection, email: str) -> dict | None:
+def find_user_by_email(target_conn: sqlite3.Connection, email: str) -> dict | None:
+    """Busca usuario no target pelo email (case-insensitive)."""
     cur = target_conn.cursor()
-    cur.execute("SELECT id, email, name, provider FROM users WHERE email = ?", (email,))
+    cur.execute(
+        "SELECT id, email, name, provider FROM users WHERE LOWER(email) = LOWER(?)",
+        (email,),
+    )
     row = cur.fetchone()
     if row:
         return {"id": row[0], "email": row[1], "name": row[2], "provider": row[3]}
     return None
 
 
-def build_id_mapping(source_data: dict, target_max_ids: dict, existing_user: dict | None) -> dict:
-    mapping = {"users": {}, "files": {}, "analyses": {}, "chat_messages": {}, "user_categories": {}}
+def build_id_mapping(
+    source_data: dict,
+    target_max_ids: dict,
+    existing_user: dict | None,
+) -> dict:
+    mapping = {
+        "users": {},
+        "files": {},
+        "analyses": {},
+        "chat_messages": {},
+        "user_categories": {},
+    }
 
     # User mapping
     if existing_user:
         mapping["users"][SOURCE_USER_ID] = existing_user["id"]
-        log(f"User ja existe na producao: id={existing_user['id']} email={existing_user['email']}")
+        log(
+            f"User existente encontrado no target: id={existing_user['id']}; "
+            f"email={existing_user['email']}; sera reutilizado"
+        )
     else:
         new_id = target_max_ids["users"] + 1
         mapping["users"][SOURCE_USER_ID] = new_id
-        log(f"User sera criado com novo id: {new_id}")
+        log(f"User NAO existe no target; sera criado com id={new_id}")
 
     target_user_id = mapping["users"][SOURCE_USER_ID]
 
@@ -190,12 +225,24 @@ def build_id_mapping(source_data: dict, target_max_ids: dict, existing_user: dic
     return mapping
 
 
-def migrate(target_conn: sqlite3.Connection, source_data: dict, id_mapping: dict, existing_user: dict | None) -> None:
+def migrate(
+    target_conn: sqlite3.Connection,
+    source_data: dict,
+    id_mapping: dict,
+    existing_user: dict | None,
+) -> None:
     cur = target_conn.cursor()
     target_user_id = id_mapping["users"][SOURCE_USER_ID]
 
-    # 1. User (so se nao existir)
-    if not existing_user:
+    # 1. User
+    if existing_user:
+        # Atualizar password_hash para que a senha local funcione na producao
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (source_data["user"]["password_hash"], target_user_id),
+        )
+        log(f"User preservado: id={target_user_id}; password_hash atualizado")
+    else:
         u = source_data["user"]
         cur.execute(
             "INSERT INTO users (id, email, name, password_hash, avatar_url, provider, created_at) "
@@ -204,8 +251,6 @@ def migrate(target_conn: sqlite3.Connection, source_data: dict, id_mapping: dict
              u["avatar_url"], u["provider"], u["created_at"]),
         )
         log(f"User inserido: id={target_user_id}")
-    else:
-        log(f"User preservado: id={existing_user['id']} (ja existente)")
 
     # 2. Files
     for f in source_data["files"]:
@@ -256,18 +301,8 @@ def validate_integrity(target_conn: sqlite3.Connection, target_user_id: int) -> 
     ok = True
 
     # Contagens
-    tables = {
-        "users": ("id", "id"),
-        "files": ("user_id", "id"),
-        "analyses": ("user_id", "id"),
-        "chat_messages": ("user_id", "id"),
-        "user_categories": ("user_id", "id"),
-    }
-    for table, (fk_col, pk_col) in tables.items():
-        if fk_col == "id":
-            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE id = ?", (target_user_id,))
-        else:
-            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {fk_col} = ?", (target_user_id,))
+    for table in ["files", "analyses", "chat_messages", "user_categories"]:
+        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE user_id = ?", (target_user_id,))
         count = cur.fetchone()[0]
         log(f"  {table}: {count} registro(s) para user_id={target_user_id}")
 
@@ -352,8 +387,9 @@ def main():
         log("--- Verificando estado do target ---")
         max_ids = get_max_ids(target_conn)
 
-        # 3. Verificar se user ja existe
-        existing_user = check_user_exists(target_conn, source_data["user"]["email"])
+        # 3. Buscar usuario existente pelo EMAIL (case-insensitive)
+        log("--- Buscando usuario por email no target ---")
+        existing_user = find_user_by_email(target_conn, source_data["user"]["email"])
 
         # 4. Mapeamento de IDs
         log("--- Construindo mapeamento de IDs ---")
@@ -363,6 +399,13 @@ def main():
         log("--- Executando migracao ---")
         if args.dry_run:
             log("DRY RUN: nenhuma alteracao gravada")
+            # Simular resultado da migracao no dry-run
+            target_user_id = id_mapping["users"][SOURCE_USER_ID]
+            log(f"  [simulado] User id={target_user_id}: {'password_hash atualizado' if existing_user else 'inserido'}")
+            log(f"  [simulado] Files: {len(source_data['files'])} registro(s)")
+            log(f"  [simulado] Analyses: {len(source_data['analyses'])} registro(s)")
+            log(f"  [simulado] Chat messages: {len(source_data['chat_messages'])} registro(s)")
+            log(f"  [simulado] User categories: {len(source_data['user_categories'])} registro(s)")
         else:
             target_conn.execute("BEGIN TRANSACTION")
             try:
