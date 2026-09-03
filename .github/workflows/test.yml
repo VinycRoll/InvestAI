@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Install frontend dependencies
+        run: |
+          pip install -r frontend/requirements.txt
+
+      - name: Install test tooling
+        run: |
+          pip install pytest ruff
+
+      - name: Lint (ruff)
+        run: |
+          ruff check backend frontend tests alembic
+
+      - name: Compile all Python sources
+        run: |
+          python -m compileall -q backend frontend tests alembic
+
+      - name: Run tests
+        run: |
+          pytest -q
+
+      - name: Build Docker images (backend + frontend)
+        run: |
+          docker build --target backend -t investia-backend:ci .
+          docker build --target frontend -t investia-frontend:ci .

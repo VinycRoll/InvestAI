@@ -1,0 +1,12 @@
+COMO SUBIR O INVESTIA
+=====================
+
+No terminal (Linux), cole o comando abaixo:
+
+  cd "/home/vinycius/Área de trabalho/InvestAI" && ./subir.sh
+
+Depois abra o site no navegador:
+  http://localhost:8501
+
+Para confirmar que subiu, você pode abrir essa URL no navegador.
+O site vai responder quando o backend e o frontend estiverem no ar.

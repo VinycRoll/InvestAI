@@ -1,0 +1,12 @@
+COMO PARAR O INVESTIA
+=====================
+
+No terminal (Linux), cole o comando abaixo:
+
+  cd "/home/vinycius/Área de trabalho/InvestAI" && ./parar.sh
+
+Isso encerra o backend (porta 8000) e o frontend (porta 8501).
+
+Para conferir, abra no navegador:
+  http://localhost:8501
+Se não abrir, parou corretamente.

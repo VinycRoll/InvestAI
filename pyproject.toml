@@ -1,0 +1,32 @@
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+]
+ignore = [
+    "B008",  # FastAPI Depends() in function args is standard
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Front-end usa strings longas de HTML/CSS inline (padrão intencional de estilo).
+"frontend/**/*.py" = ["E501"]
+# Detecção de disponibilidade do Playwright via try/except (import intencionalmente
+# marcado como não usado).
+"tests/test_e2e.py" = ["F401"]
+# Alembic: env.py importa os models de propósito para popular o metadata no
+# autogenerate; a ordenação de imports vem do template gerado.
+"alembic/env.py" = ["F401", "I001"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
