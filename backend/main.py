@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import logging
 import time
@@ -154,6 +156,48 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class AvatarUpdateRequest(BaseModel):
+    avatar_url: str
+
+
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_PREFIXES = {
+    "image/png": b"\x89PNG\r\n\x1a\n",
+    "image/jpeg": b"\xff\xd8\xff",
+}
+
+
+def _decode_avatar(avatar_url: str) -> str:
+    """Validate an avatar data URL before storing it with the user account."""
+    try:
+        header, encoded_image = avatar_url.split(",", 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Imagem de perfil inválida") from None
+
+    allowed_headers = {f"data:{mime};base64": mime for mime in (*AVATAR_PREFIXES, "image/webp")}
+    mime_type = allowed_headers.get(header.lower())
+    if not mime_type:
+        raise HTTPException(status_code=400, detail="Use uma imagem PNG, JPEG ou WebP")
+
+    try:
+        image_bytes = base64.b64decode(encoded_image, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Imagem de perfil inválida") from None
+
+    if not image_bytes or len(image_bytes) > AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="A imagem deve ter no máximo 2 MB")
+
+    is_valid_image = (
+        image_bytes.startswith(AVATAR_PREFIXES.get(mime_type, b""))
+        if mime_type != "image/webp"
+        else image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP"
+    )
+    if not is_valid_image:
+        raise HTTPException(status_code=400, detail="O conteúdo não corresponde ao tipo da imagem")
+
+    return f"data:{mime_type};base64,{encoded_image}"
+
+
 @app.post("/api/auth/register", summary="Criar conta",
           description="Registra novo usuário com email, nome e senha. Retorna JWT token.")
 def register(req: RegisterRequest, request: Request, db: Session = Depends(get_db)):
@@ -188,6 +232,14 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
 @app.get("/api/auth/me", summary="Usuário atual", description="Retorna dados do usuário autenticado.")
 def get_me(user: User = Depends(get_current_user)):
     return {"id": user.id, "email": user.email, "name": user.name, "avatar_url": user.avatar_url}
+
+
+@app.post("/api/auth/avatar", summary="Atualizar foto de perfil")
+def update_avatar(req: AvatarUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user.avatar_url = _decode_avatar(req.avatar_url)
+    db.commit()
+    db.refresh(user)
+    return {"user": {"id": user.id, "email": user.email, "name": user.name, "avatar_url": user.avatar_url}}
 
 
 class RefreshTokenRequest(BaseModel):

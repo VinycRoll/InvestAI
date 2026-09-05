@@ -321,6 +321,38 @@ def test_analysis_expenses_only_no_suggested_investment():
 # AUTH
 # =============================================================================
 
+def test_update_avatar_persists_for_current_user():
+    creds = _register()
+    avatar_url = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9JrS8AAAAASUVORK5CYII="
+    )
+
+    response = _client_ctx.post(
+        "/api/auth/avatar",
+        headers=_headers(creds["token"]),
+        json={"avatar_url": avatar_url},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["user"]["avatar_url"] == avatar_url
+
+    me = _client_ctx.get("/api/auth/me", headers=_headers(creds["token"]))
+    assert me.json()["avatar_url"] == avatar_url
+
+
+def test_update_avatar_rejects_unsupported_image_type():
+    creds = _register()
+    response = _client_ctx.post(
+        "/api/auth/avatar",
+        headers=_headers(creds["token"]),
+        json={"avatar_url": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="},
+    )
+
+    assert response.status_code == 400
+    assert "PNG, JPEG ou WebP" in response.json()["detail"]
+
+
 def test_refresh_token_has_type_refresh():
     from backend.auth import create_refresh_token, verify_token
     token = create_refresh_token({"sub": "1"})

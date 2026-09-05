@@ -1,8 +1,41 @@
 """Settings page."""
+import base64
+from io import BytesIO
+
 import streamlit as st
 from components.cards import page_header, section_label
 from helpers import escape_html, toast
+from PIL import Image, ImageOps, UnidentifiedImageError
 from services import api
+from streamlit_cropper import st_cropper
+
+AVATAR_INPUT_MAX_BYTES = 10 * 1024 * 1024
+AVATAR_OUTPUT_SIZE = 512
+
+
+def _open_avatar(image_bytes: bytes) -> Image.Image | None:
+    """Load an uploaded avatar safely for the visual crop editor."""
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB").copy()
+    except (OSError, UnidentifiedImageError):
+        return None
+
+    width, height = image.size
+    if not width or not height or width * height > 40_000_000:
+        return None
+
+    return image
+
+
+def _encode_avatar(avatar: Image.Image) -> bytes:
+    """Resize a cropped image for storage as a compact profile avatar."""
+    avatar = avatar.convert("RGB")
+    avatar = avatar.resize((AVATAR_OUTPUT_SIZE, AVATAR_OUTPUT_SIZE), Image.Resampling.LANCZOS)
+
+    output = BytesIO()
+    avatar.save(output, format="JPEG", quality=88, optimize=True)
+    return output.getvalue()
 
 
 def settings_page() -> None:
@@ -34,6 +67,47 @@ def settings_page() -> None:
     </div>
     """, unsafe_allow_html=True)
 
+    section_label("Foto de Perfil")
+    avatar_url = user.get("avatar_url")
+    if avatar_url and avatar_url.startswith("data:"):
+        try:
+            st.image(base64.b64decode(avatar_url.split(",", 1)[1]), width=96)
+        except (IndexError, ValueError):
+            pass
+
+    uploaded_avatar = st.file_uploader(
+        "Escolha uma imagem PNG, JPEG ou WebP (máx. 10 MB)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="profile_avatar_upload",
+    )
+    if uploaded_avatar:
+        avatar_bytes = uploaded_avatar.getvalue()
+        if len(avatar_bytes) > AVATAR_INPUT_MAX_BYTES:
+            st.error("A imagem original deve ter no máximo 10 MB.")
+        else:
+            source_avatar = _open_avatar(avatar_bytes)
+            if not source_avatar:
+                st.error("Não foi possível processar essa imagem. Escolha outro arquivo.")
+            else:
+                st.caption("Arraste a moldura quadrada e use a rolagem do mouse para aproximar ou afastar.")
+                cropped_image = st_cropper(
+                    source_avatar,
+                    aspect_ratio=(1, 1),
+                    box_color="#6C63FF",
+                    realtime_update=True,
+                    key="profile_avatar_cropper",
+                )
+                cropped_avatar = _encode_avatar(cropped_image)
+                st.image(cropped_avatar, width=160, caption="Prévia da foto de perfil")
+                if st.button("Salvar foto de perfil", type="primary", key="save_profile_avatar"):
+                    avatar_data_url = f"data:image/jpeg;base64,{base64.b64encode(cropped_avatar).decode('ascii')}"
+                    result = api.api_call("post", "/api/auth/avatar", json={"avatar_url": avatar_data_url})
+                    if result and result.get("user"):
+                        st.session_state.user = result["user"]
+                        toast("Foto de perfil atualizada!", "success")
+                        st.rerun()
+
+    st.markdown('<div style="height:24px;"></div>', unsafe_allow_html=True)
     section_label("Alterar Senha")
     with st.form("change_password_form"):
         current_pw = st.text_input("Senha atual", type="password", placeholder="Sua senha atual")

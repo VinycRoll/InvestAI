@@ -25,6 +25,7 @@ Análise financeira pessoal com inteligência artificial. Envie extratos bancár
 - **Sugestão de investimento**: 80% da margem mensal (estimativa)
 - **Export**: HTML, CSV, JSON e PDF
 - **Chat financeiro**: Conversa sobre seus dados e mercado
+- **Foto de perfil**: Recorte visual quadrado e armazenamento de avatar otimizado
 - **Isolamento entre usuários**: dados restritos ao dono (JWT)
 
 ## Setup

@@ -1,6 +1,7 @@
 """Sidebar navigation rendering (native Streamlit buttons + theme/logout controls)."""
 import streamlit as st
 from components.icons import icon
+from helpers import escape_html
 
 NAV_ITEMS = [
     ("Dashboard", "dashboard"),
@@ -18,14 +19,23 @@ def sidebar() -> str:
         user = st.session_state.user or {}
         name = user.get("name", "Usuário")
         email = user.get("email", "")
+        avatar_url = user.get("avatar_url", "")
+        if avatar_url:
+            avatar_html = (
+                f'<img src="{escape_html(avatar_url)}" alt="Foto de perfil" '
+                'style="width:96px!important;height:96px!important;display:block;object-fit:cover;border-radius:22px;">'
+            )
+        else:
+            initial = escape_html(name[:1].upper() if name else "U")
+            avatar_html = f'<span>{initial}</span>'
 
         st.markdown(f"""
         <div style="padding:4px 0 20px;">
             <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
-                <div style="width:40px;height:40px;background:linear-gradient(135deg,#6C63FF,#4ECDC4);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:16px;color:white;font-weight:700;">{name[0].upper()}</div>
+                <div style="width:96px!important;min-width:96px;height:96px!important;background:linear-gradient(135deg,#6C63FF,#4ECDC4);border-radius:22px;display:flex;align-items:center;justify-content:center;font-size:32px;color:white;font-weight:700;overflow:hidden;">{avatar_html}</div>
                 <div>
-                    <div style="color:var(--text-primary);font-size:14px;font-weight:600;">{name}</div>
-                    <div style="color:var(--text-muted);font-size:11px;">{email}</div>
+                    <div style="color:var(--text-primary);font-size:14px;font-weight:600;">{escape_html(name)}</div>
+                    <div style="color:var(--text-muted);font-size:11px;">{escape_html(email)}</div>
                 </div>
             </div>
         </div>
