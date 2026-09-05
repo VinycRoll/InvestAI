@@ -1,11 +1,13 @@
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import inspect as sa_inspect, text
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -38,9 +40,17 @@ from .services.analysis import (
 from .services.export import ExportService
 from .services.gemini import GeminiAPIError, GeminiService, aclose_client
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("backend").setLevel(logging.INFO)
+    logger.info("Application logging configured for upload diagnostics")
     yield
     await aclose_client()
 
@@ -261,6 +271,17 @@ async def upload_file(
         parsed = parser(content, file.filename)
     else:
         parsed = parser(content)
+
+    if ext == "pdf":
+        diagnostics = parsed.get("_diagnostics", {})
+        logger.info(
+            "PDF upload parsed: size_bytes=%d pages=%s tables=%s methods=%s transactions=%s",
+            len(content),
+            parsed.get("pages"),
+            diagnostics.get("tables_found"),
+            diagnostics.get("extraction_methods"),
+            parsed.get("total_transactions"),
+        )
 
     db_file = FileModel(
         user_id=user.id,
